@@ -1,0 +1,9 @@
+@misc{yuan2025naturalreasoningreasoningwild28m,
+      title={NaturalReasoning: Reasoning in the Wild with 2.8M Challenging Questions}, 
+      author={Weizhe Yuan and Jane Yu and Song Jiang and Karthik Padthe and Yang Li and Dong Wang and Ilia Kulikov and Kyunghyun Cho and Yuandong Tian and Jason E Weston and Xian Li},
+      year={2025},
+      eprint={2502.13124},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2502.13124}, 
+}
