@@ -5,18 +5,46 @@ include("training_system_modular.jl")
 
 function main()
     if length(ARGS) < 1
-        println("Usage: julia run_model.jl \"your query here\"")
+        println("Usage: julia run_model.jl \"your query here\" [--conversational] [--model <path>]")
         return
     end
     
     model_path = "trained_model.json"
     conversational = false
+
     args = copy(ARGS)
-    if !isempty(args) && (args[end] == "--conversational" || args[end] == "-conversational")
-        conversational = true
-        pop!(args)
+
+    filtered = String[]
+    i = 1
+    while i <= length(args)
+        a = args[i]
+        if a == "--conversational" || a == "-conversational"
+            conversational = true
+            i += 1
+            continue
+        elseif a == "--model" || a == "-m"
+            if i == length(args)
+                println("Missing value for --model")
+                return
+            end
+            model_path = args[i + 1]
+            i += 2
+            continue
+        elseif startswith(a, "--rl")
+            println("Note: inference-time RL is disabled. Ignoring flag: $a")
+            if (a == "--rl-save" || a == "--rl-alpha" || a == "--rl-beta") && i < length(args)
+                i += 2
+            else
+                i += 1
+            end
+            continue
+        else
+            push!(filtered, a)
+            i += 1
+        end
     end
-    query = join(args, " ")
+
+    query = join(filtered, " ")
     
     println("Loading model from $model_path...")
     

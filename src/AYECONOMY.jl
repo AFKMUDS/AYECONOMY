@@ -1,0 +1,3 @@
+module AYECONOMY
+
+end

@@ -4,6 +4,14 @@ using Statistics
 using Random
 using StatsBase
 
+const GLUE_TOKENS = Set([
+    "what", "is", "are", "the", "a", "an", "of", "to", "and", "or", "in", "on", "for", "with", "as",
+    "how", "do", "does", "did", "who", "why", "when", "where",
+    "?", "!", ".", ","
+])
+
+const GLUE_CONTENT_REINFORCE_FACTOR = 0.04
+
 # Constants for connection and token management
 const CONNECTION_THRESHOLD = 0.5  # Threshold for significant connections between tokens
 const MIN_TOKEN_IMPORTANCE = 0.2  # Minimum importance threshold for tokens to be retained
@@ -266,14 +274,18 @@ function build_connections(tokens::Vector{<:AbstractString}, module_name::String
             continue
         end
         
+        current_is_glue = current in GLUE_TOKENS
+        next_is_glue = next in GLUE_TOKENS
+        reinforce_factor = (current_is_glue ⊻ next_is_glue) ? GLUE_CONTENT_REINFORCE_FACTOR : 1.0
+
         # Update or create connection with dynamic strength adjustment
         if haskey(module_obj.tokens[current].connections, next)
             # Connections that are reinforced frequently get diminishing returns
             current_strength = module_obj.tokens[current].connections[next]
             strength_factor = 1.0 / (1.0 + current_strength)
-            module_obj.tokens[current].connections[next] += 0.1 * strength_factor
+            module_obj.tokens[current].connections[next] += reinforce_factor * (0.1 * strength_factor)
         else
-            module_obj.tokens[current].connections[next] = 0.1
+            module_obj.tokens[current].connections[next] = reinforce_factor * 0.1
         end
     end
     

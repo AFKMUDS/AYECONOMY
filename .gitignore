@@ -1,0 +1,27 @@
+# Models / artifacts
+trained_model*.json
+ogtrained_model*.json
+
+# Datasets
+natural_reasoning*
+**/natural_reasoning*
+*.jsonl
+
+# Graph exports / originals
+oggraphs/
+graphs/
+
+# Wiki / docs dumps
+wiki/
+
+# Julia artifacts
+*.ji
+*.julia
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db

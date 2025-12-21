@@ -11,6 +11,35 @@ using DataFrames
 using ArgParse
 using Dates
 
+global AYE_GUARDRAILS_ENABLED = false
+global AYE_GUARDRAILS_REPORT = false
+global AYE_CONN_MAX = 0.35
+global AYE_WORMHOLE_MAX = 1.0
+global AYE_GLUE_IMPORTANCE_MAX = 1.0e-6
+global AYE_GLUE_TOKENS = Set([
+    "what", "is", "are", "the", "a", "an", "of", "to", "and", "or", "in", "on", "for", "with", "as",
+    "how", "do", "does", "did", "who", "why", "when", "where",
+    "?", "!", ".", ","
+])
+
+global AYE_RL_NUDGE_ENABLED = false
+global AYE_RL_ALPHA = 0.01
+global AYE_RL_BETA = 0.03
+global AYE_RL_SCOPE = Set([
+    "what", "is", "are", "the", "a", "an", "of", "to", "and", "or", "in", "on", "for", "with", "as",
+    "how", "do", "does", "did", "who", "why", "when", "where",
+    "means", "defined", "define", "because", "therefore", "thus", "so", "concept"
+])
+
+global AYE_TRAIN_PROBES_ENABLED = false
+global AYE_TRAIN_PROBES_REPORT = false
+global AYE_TRAIN_PROBES = String[
+    "what is gravity?",
+    "what is geometry?",
+    "define energy",
+    "what is topology?"
+]
+
 # Global timestamp for model versioning
 global global_timestamp = string(Dates.now())
 
@@ -76,47 +105,354 @@ function _pick_start_token(tokens::Vector{String}, token_map::Dict{String, Any})
     return best2
 end
 
+function _token_artifact_penalty(t::AbstractString)
+    if isempty(t)
+        return 10.0
+    end
+    letters = 0
+    digits = 0
+    punct = 0
+    for c in t
+        if isletter(c)
+            letters += 1
+        elseif isnumeric(c)
+            digits += 1
+        else
+            punct += 1
+        end
+    end
+    len = max(length(t), 1)
+    p_ratio = punct / len
+    penalty = 0.0
+    if p_ratio >= 0.6
+        penalty += 4.0
+    elseif p_ratio >= 0.4
+        penalty += 2.0
+    end
+    if occursin("@", t)
+        penalty += 2.0
+    end
+    if occursin("\\", t)
+        penalty += 3.0
+    end
+    if occursin("{", t) || occursin("}", t) || occursin("[", t) || occursin("]", t)
+        penalty += 1.5
+    end
+    if t == "\"" || t == "'"
+        penalty += 1.0
+    end
+    return penalty
+end
+
+function _softmax_sample(cands::Vector{Tuple{String, Float64}}; top_k::Int=12, temperature::Float64=0.9)
+    if isempty(cands)
+        return nothing
+    end
+    sort!(cands, by=x->x[2], rev=true)
+    k = min(top_k, length(cands))
+    sliced = cands[1:k]
+    scores = [x[2] for x in sliced]
+    m = maximum(scores)
+    denom = 0.0
+    probs = Vector{Float64}(undef, k)
+    temp = max(temperature, 1e-6)
+    for i in 1:k
+        z = exp((scores[i] - m) / temp)
+        probs[i] = z
+        denom += z
+    end
+    if denom <= 0
+        return sliced[1][1]
+    end
+    r = rand() * denom
+    acc = 0.0
+    for i in 1:k
+        acc += probs[i]
+        if r <= acc
+            return sliced[i][1]
+        end
+    end
+    return sliced[end][1]
+end
+
 function _choose_next_token(current::String, token_map::Dict{String, Any}, used::Set{String}, query_set::Set{String}, goal_token)
     if !haskey(token_map, current)
         return nothing
     end
     obj = token_map[current]
     conns = get(obj, "connections", [])
+    wormholes = get(obj, "wormholes", [])
     if conns === nothing || isempty(conns)
-        return nothing
+        if wormholes === nothing || isempty(wormholes)
+            return nothing
+        end
     end
 
-    best = nothing
-    best_score = -Inf
+    cands = Tuple{String, Float64}[]
     for c in conns
         dst = get(c, "token", nothing)
         if dst === nothing
             continue
         end
         dsts = String(dst)
-        used_penalty = (dsts in used) ? 0.05 : 1.0
         strength = Float64(get(c, "strength", 0.0))
         dst_imp = 0.0
         if haskey(token_map, dsts)
             dst_imp = Float64(get(token_map[dsts], "importance", 0.0))
         end
-        score = strength + 0.05 * log(1.0 + max(dst_imp, 0.0))
+
+        score = strength + 0.08 * log(1.0 + max(dst_imp, 0.0))
+
         if dsts in query_set
-            score += 10.0
+            score += 6.0
         end
         if goal_token !== nothing && dsts == goal_token
-            score += 20.0
+            score += 18.0
         end
+
         if _is_stop_token(dsts)
-            score *= 0.2
+            score -= 1.25
         end
-        score *= used_penalty
-        if score > best_score
-            best_score = score
-            best = dsts
+
+        score -= _token_artifact_penalty(dsts)
+
+        if dsts in used
+            score -= 2.5
+        end
+
+        push!(cands, (dsts, score))
+    end
+
+    if wormholes !== nothing && !isempty(wormholes)
+        for w in wormholes
+            dst = get(w, "token", nothing)
+            if dst === nothing
+                continue
+            end
+            dsts = String(dst)
+            strength = Float64(get(w, "strength", 0.0))
+            dist = Int(get(w, "distance", 2))
+
+            dst_imp = 0.0
+            if haskey(token_map, dsts)
+                dst_imp = Float64(get(token_map[dsts], "importance", 0.0))
+            end
+
+            score = 0.70 * strength + 0.04 * log(1.0 + max(dst_imp, 0.0))
+            score -= 0.15 * max(dist - 1, 0)
+
+            if dsts in query_set
+                score += 5.0
+            end
+            if goal_token !== nothing && dsts == goal_token
+                score += 16.0
+            end
+
+            if _is_stop_token(dsts)
+                score -= 1.0
+            end
+            score -= _token_artifact_penalty(dsts)
+            if dsts in used
+                score -= 2.0
+            end
+
+            push!(cands, (dsts, score))
         end
     end
-    return best
+
+    if isempty(cands)
+        return nothing
+    end
+
+    return _softmax_sample(cands; top_k=12, temperature=0.85)
+end
+
+function _choose_next_token_with_meta(current::String, token_map::Dict{String, Any}, used::Set{String}, query_set::Set{String}, goal_token)
+    if !haskey(token_map, current)
+        return (nothing, nothing)
+    end
+    obj = token_map[current]
+    conns = get(obj, "connections", [])
+    wormholes = get(obj, "wormholes", [])
+    if conns === nothing || isempty(conns)
+        if wormholes === nothing || isempty(wormholes)
+            return (nothing, nothing)
+        end
+    end
+
+    cands = Tuple{String, Float64, Symbol}[]
+    for c in conns
+        dst = get(c, "token", nothing)
+        if dst === nothing
+            continue
+        end
+        dsts = String(dst)
+        strength = Float64(get(c, "strength", 0.0))
+        dst_imp = 0.0
+        if haskey(token_map, dsts)
+            dst_imp = Float64(get(token_map[dsts], "importance", 0.0))
+        end
+
+        score = strength + 0.08 * log(1.0 + max(dst_imp, 0.0))
+
+        if dsts in query_set
+            score += 6.0
+        end
+        if goal_token !== nothing && dsts == goal_token
+            score += 18.0
+        end
+
+        if _is_stop_token(dsts)
+            score -= 1.25
+        end
+
+        score -= _token_artifact_penalty(dsts)
+
+        if dsts in used
+            score -= 2.5
+        end
+
+        push!(cands, (dsts, score, :connections))
+    end
+
+    if wormholes !== nothing && !isempty(wormholes)
+        for w in wormholes
+            dst = get(w, "token", nothing)
+            if dst === nothing
+                continue
+            end
+            dsts = String(dst)
+            strength = Float64(get(w, "strength", 0.0))
+            dist = Int(get(w, "distance", 2))
+
+            dst_imp = 0.0
+            if haskey(token_map, dsts)
+                dst_imp = Float64(get(token_map[dsts], "importance", 0.0))
+            end
+
+            score = 0.70 * strength + 0.04 * log(1.0 + max(dst_imp, 0.0))
+            score -= 0.15 * max(dist - 1, 0)
+
+            if dsts in query_set
+                score += 5.0
+            end
+            if goal_token !== nothing && dsts == goal_token
+                score += 16.0
+            end
+
+            if _is_stop_token(dsts)
+                score -= 1.0
+            end
+            score -= _token_artifact_penalty(dsts)
+            if dsts in used
+                score -= 2.0
+            end
+
+            push!(cands, (dsts, score, :wormholes))
+        end
+    end
+
+    if isempty(cands)
+        return (nothing, nothing)
+    end
+
+    scored = [(a[1], a[2]) for a in cands]
+    chosen = _softmax_sample(scored; top_k=12, temperature=0.85)
+    if chosen === nothing
+        return (nothing, nothing)
+    end
+
+    kind = nothing
+    for c in cands
+        if c[1] == chosen
+            kind = c[3]
+            break
+        end
+    end
+    return (chosen, kind)
+end
+
+function _rl_apply_nudges!(model, top_module::String, steps::Vector{Tuple{String, String, Symbol}}; stalled::Bool=false, alpha::Float64=AYE_RL_ALPHA, beta::Float64=AYE_RL_BETA)
+    if isempty(steps)
+        return 0
+    end
+    if !haskey(model, "modules") || !haskey(model["modules"], top_module)
+        return 0
+    end
+    moddata = model["modules"][top_module]
+    top_tokens = get(moddata, "top_tokens", [])
+    if top_tokens === nothing || !(top_tokens isa Vector)
+        return 0
+    end
+
+    idx = Dict{String, Any}()
+    for t in top_tokens
+        if t isa Dict
+            v = get(t, "value", nothing)
+            if v !== nothing
+                idx[String(v)] = t
+            end
+        end
+    end
+
+    updates = 0
+    for (src, dst, kind) in steps
+        if !(src in AYE_RL_SCOPE)
+            continue
+        end
+        if !haskey(idx, src)
+            continue
+        end
+        sobj = idx[src]
+        edges = get(sobj, String(kind), [])
+        if edges === nothing || !(edges isa Vector)
+            continue
+        end
+
+        for e in edges
+            if !(e isa Dict)
+                continue
+            end
+            if String(get(e, "token", "")) != dst
+                continue
+            end
+            s = Float64(get(e, "strength", 0.0))
+            s *= (1.0 + alpha)
+            hi = (kind == :connections) ? AYE_CONN_MAX : AYE_WORMHOLE_MAX
+            if s < 0.0
+                s = 0.0
+            end
+            if s > hi
+                s = hi
+            end
+            e["strength"] = s
+            updates += 1
+            break
+        end
+    end
+
+    if stalled && !isempty(steps)
+        (src, dst, kind) = steps[end]
+        if haskey(idx, src)
+            sobj = idx[src]
+            edges = get(sobj, String(kind), [])
+            if edges !== nothing && (edges isa Vector)
+                for e in edges
+                    if e isa Dict && String(get(e, "token", "")) == dst
+                        s = Float64(get(e, "strength", 0.0))
+                        s *= max(0.0, (1.0 - beta))
+                        if s < 0.0
+                            s = 0.0
+                        end
+                        e["strength"] = s
+                        updates += 1
+                        break
+                    end
+                end
+            end
+        end
+    end
+    return updates
 end
 
 function _tokens_to_text(seq::Vector{String})
@@ -146,10 +482,12 @@ function _tokens_to_text(seq::Vector{String})
     return String(take!(out))
 end
 
-function run_inference_conversational(model, query::String; max_tokens::Int=24)
+function run_inference_conversational(model, query::String; max_tokens::Int=24, rl_nudge::Bool=AYE_RL_NUDGE_ENABLED, rl_save_path=nothing, silent::Bool=false)
     tokens = TokenSystem.tokenize_text(query)
     if isempty(tokens)
-        println("(empty)")
+        if !silent
+            println("(empty)")
+        end
         return
     end
 
@@ -191,7 +529,9 @@ function run_inference_conversational(model, query::String; max_tokens::Int=24)
     token_map = _get_module_top_tokens_map(model, top_module)
     start = _pick_start_token(tokens, token_map)
     if start === nothing
-        println("(no tokens available)")
+        if !silent
+            println("(no tokens available)")
+        end
         return
     end
 
@@ -200,9 +540,27 @@ function run_inference_conversational(model, query::String; max_tokens::Int=24)
     push!(seq, start)
     push!(used, start)
 
+    steps = Tuple{String, String, Symbol}[]
+
     current = start
+    stalled = false
     for _ in 1:(max_tokens - 1)
-        nxt = _choose_next_token(current, token_map, used, query_set, goal_token)
+        if rl_nudge
+            (nxt, kind) = _choose_next_token_with_meta(current, token_map, used, query_set, goal_token)
+            if nxt === nothing
+                stalled = true
+                break
+            end
+            if kind !== nothing
+                push!(steps, (current, nxt, kind))
+            end
+        else
+            nxt = _choose_next_token(current, token_map, used, query_set, goal_token)
+            if nxt === nothing
+                break
+            end
+        end
+
         if nxt === nothing
             break
         end
@@ -211,7 +569,58 @@ function run_inference_conversational(model, query::String; max_tokens::Int=24)
         current = nxt
     end
 
-    println(_tokens_to_text(seq))
+    if rl_nudge
+        updates = _rl_apply_nudges!(model, top_module, steps; stalled=stalled)
+        if !silent && updates > 0
+            println("(rl) updates=$(updates) stalled=$(stalled) module=$(top_module)")
+        end
+        if rl_save_path !== nothing
+            try
+                open(String(rl_save_path), "w") do io
+                    JSON3.write(io, model)
+                end
+            catch
+            end
+        end
+    end
+
+    if !silent
+        println(_tokens_to_text(seq))
+    end
+end
+
+function _load_train_probes_from_file(path::String)
+    if isempty(path) || !isfile(path)
+        return nothing
+    end
+    lines = readlines(path)
+    probes = String[]
+    for ln in lines
+        s = strip(ln)
+        if isempty(s)
+            continue
+        end
+        if startswith(s, "#")
+            continue
+        end
+        push!(probes, s)
+    end
+    return probes
+end
+
+function _apply_training_probes!(model)
+    if !AYE_TRAIN_PROBES_ENABLED
+        return 0
+    end
+    ran = 0
+    for p in AYE_TRAIN_PROBES
+        try
+            run_inference_conversational(model, p; rl_nudge=true, rl_save_path=nothing, silent=true)
+            ran += 1
+        catch
+        end
+    end
+    return ran
 end
 
 # Include all modules
@@ -984,6 +1393,40 @@ function parse_commandline()
         "--wave-training"
             help = "Use wave-based training approach (deprecated, use train_waves command instead)"
             action = :store_true
+
+        "--guardrails"
+            help = "Enable training-time guardrails when saving models (caps connections/wormholes and clamps glue-token importance)"
+            action = :store_true
+        "--guardrails-report"
+            help = "Print a short guardrails report at each save checkpoint"
+            action = :store_true
+        "--conn-max"
+            help = "Maximum connection strength when guardrails are enabled"
+            arg_type = Float64
+            default = 0.35
+        "--wormhole-max"
+            help = "Maximum wormhole strength when guardrails are enabled"
+            arg_type = Float64
+            default = 1.0
+        "--glue-imp-max"
+            help = "Maximum importance allowed for glue tokens (what/is/the/of/...) when guardrails are enabled"
+            arg_type = Float64
+            default = 1.0e-6
+
+        "--train-probes"
+            help = "Enable training-time probe nudges by providing a probes text file (one prompt per line)"
+            default = ""
+        "--train-probes-report"
+            help = "Print a one-line note at each save when training-time probes are enabled"
+            action = :store_true
+        "--train-probes-alpha"
+            help = "Alpha reward multiplier for training-time probe nudges"
+            arg_type = Float64
+            default = 0.01
+        "--train-probes-beta"
+            help = "Beta penalty multiplier for training-time probe nudges"
+            arg_type = Float64
+            default = 0.03
     end
     
     return parse_args(s)
@@ -996,6 +1439,22 @@ Main entry point for the training system.
 """
 function main()
     args = parse_commandline()
+
+    global AYE_GUARDRAILS_ENABLED = get(args, "guardrails", false)
+    global AYE_GUARDRAILS_REPORT = get(args, "guardrails-report", false)
+    global AYE_CONN_MAX = Float64(get(args, "conn-max", 0.35))
+    global AYE_WORMHOLE_MAX = Float64(get(args, "wormhole-max", 1.0))
+    global AYE_GLUE_IMPORTANCE_MAX = Float64(get(args, "glue-imp-max", 1.0e-6))
+
+    probes_path = String(get(args, "train-probes", ""))
+    probes = _load_train_probes_from_file(probes_path)
+    global AYE_TRAIN_PROBES_ENABLED = probes !== nothing && !isempty(probes)
+    global AYE_TRAIN_PROBES_REPORT = get(args, "train-probes-report", false)
+    if AYE_TRAIN_PROBES_ENABLED
+        global AYE_TRAIN_PROBES = probes
+        global AYE_RL_ALPHA = Float64(get(args, "train-probes-alpha", 0.01))
+        global AYE_RL_BETA = Float64(get(args, "train-probes-beta", 0.03))
+    end
     
     command = args["command"]
     
@@ -1052,11 +1511,16 @@ function save_model_to_file(file_path::String; progress::Float64=0.0, last_proce
         
         # Add top tokens
         sorted_tokens = sort(collect(module_data.tokens), by=x->x[2].importance, rev=true)
-        for (token, token_data) in sorted_tokens[1:min(1000, length(sorted_tokens))]
+
+        local exported = Dict{String, Any}()
+        local max_top = 1000
+
+        for (token, token_data) in sorted_tokens[1:min(max_top, length(sorted_tokens))]
             token_info = Dict{String, Any}(
                 "value" => token,
                 "importance" => token_data.importance,
-                "connections" => []
+                "connections" => [],
+                "wormholes" => []
             )
             
             # Add connections
@@ -1066,8 +1530,89 @@ function save_model_to_file(file_path::String; progress::Float64=0.0, last_proce
                     "strength" => strength
                 ))
             end
+
+            # Add wormholes (2-hop path compression over the full in-memory graph)
+            worm_scores = Dict{String, Float64}()
+            for (mid, s1) in token_data.connections
+                if !haskey(module_data.tokens, mid)
+                    continue
+                end
+                mid_obj = module_data.tokens[mid]
+                for (dst, s2) in mid_obj.connections
+                    if dst == token
+                        continue
+                    end
+                    if haskey(token_data.connections, dst)
+                        continue
+                    end
+                    worm_scores[dst] = get(worm_scores, dst, 0.0) + Float64(s1) * Float64(s2)
+                end
+            end
+            if !isempty(worm_scores)
+                top_ws = sort(collect(worm_scores), by=x->x[2], rev=true)[1:min(8, length(worm_scores))]
+                for (dst, sc) in top_ws
+                    push!(token_info["wormholes"], Dict{String, Any}(
+                        "token" => dst,
+                        "strength" => sc,
+                        "distance" => 2
+                    ))
+                end
+            end
             
             push!(model["modules"][name]["top_tokens"], token_info)
+            exported[String(token)] = token_info
+        end
+
+        # Ensure glue tokens remain available for module-local conversational inference.
+        # Guardrails often clamp glue-token importance very low, which can push them out of the top-N export at scale.
+        for gt in AYE_GLUE_TOKENS
+            gts = String(gt)
+            if haskey(module_data.tokens, gts) && !haskey(exported, gts)
+                gtok = module_data.tokens[gts]
+                token_info = Dict{String, Any}(
+                    "value" => gts,
+                    "importance" => gtok.importance,
+                    "connections" => [],
+                    "wormholes" => []
+                )
+
+                for (connected_token, strength) in gtok.connections
+                    push!(token_info["connections"], Dict{String, Any}(
+                        "token" => connected_token,
+                        "strength" => strength
+                    ))
+                end
+
+                worm_scores = Dict{String, Float64}()
+                for (mid, s1) in gtok.connections
+                    if !haskey(module_data.tokens, mid)
+                        continue
+                    end
+                    mid_obj = module_data.tokens[mid]
+                    for (dst, s2) in mid_obj.connections
+                        if dst == gts
+                            continue
+                        end
+                        if haskey(gtok.connections, dst)
+                            continue
+                        end
+                        worm_scores[dst] = get(worm_scores, dst, 0.0) + Float64(s1) * Float64(s2)
+                    end
+                end
+                if !isempty(worm_scores)
+                    top_ws = sort(collect(worm_scores), by=x->x[2], rev=true)[1:min(8, length(worm_scores))]
+                    for (dst, sc) in top_ws
+                        push!(token_info["wormholes"], Dict{String, Any}(
+                            "token" => dst,
+                            "strength" => sc,
+                            "distance" => 2
+                        ))
+                    end
+                end
+
+                push!(model["modules"][name]["top_tokens"], token_info)
+                exported[gts] = token_info
+            end
         end
         
         # Add micro-models
@@ -1156,6 +1701,118 @@ function save_model_to_file(file_path::String; progress::Float64=0.0, last_proce
         "total_entries" => total_entries,
         "global_timestamp" => global_timestamp
     )
+
+    if AYE_TRAIN_PROBES_ENABLED
+        ran = _apply_training_probes!(model)
+        if AYE_TRAIN_PROBES_REPORT
+            println("(train-probes) ran=$(ran) alpha=$(AYE_RL_ALPHA) beta=$(AYE_RL_BETA)")
+        end
+    end
+
+    function _clamp01(x::Float64, hi::Float64)
+        if isnan(x) || !isfinite(x)
+            return 0.0
+        end
+        if x < 0.0
+            return 0.0
+        end
+        if x > hi
+            return hi
+        end
+        return x
+    end
+
+    function _apply_guardrails!(m)
+        if !AYE_GUARDRAILS_ENABLED
+            return
+        end
+        if !haskey(m, "modules")
+            return
+        end
+        for (modname, moddata) in m["modules"]
+            top_tokens = get(moddata, "top_tokens", [])
+            if top_tokens === nothing || !(top_tokens isa Vector)
+                continue
+            end
+            for t in top_tokens
+                if !(t isa Dict)
+                    continue
+                end
+                v = get(t, "value", "")
+                vstr = String(v)
+                if vstr in AYE_GLUE_TOKENS
+                    t["importance"] = min(Float64(get(t, "importance", 0.0)), AYE_GLUE_IMPORTANCE_MAX)
+                end
+
+                conns = get(t, "connections", [])
+                if conns !== nothing && conns isa Vector
+                    for c in conns
+                        if c isa Dict && haskey(c, "strength")
+                            c["strength"] = _clamp01(Float64(get(c, "strength", 0.0)), AYE_CONN_MAX)
+                        end
+                    end
+                end
+
+                whs = get(t, "wormholes", [])
+                if whs !== nothing && whs isa Vector
+                    for w in whs
+                        if w isa Dict && haskey(w, "strength")
+                            w["strength"] = _clamp01(Float64(get(w, "strength", 0.0)), AYE_WORMHOLE_MAX)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    function _guardrail_report(m)
+        if !(AYE_GUARDRAILS_ENABLED && AYE_GUARDRAILS_REPORT)
+            return
+        end
+        if !haskey(m, "modules")
+            return
+        end
+        println("\n=== GUARDRAILS REPORT ===")
+        println("conn_max=$(AYE_CONN_MAX) wormhole_max=$(AYE_WORMHOLE_MAX) glue_imp_max=$(AYE_GLUE_IMPORTANCE_MAX)")
+        for (modname, moddata) in m["modules"]
+            top_tokens = get(moddata, "top_tokens", [])
+            if top_tokens === nothing || !(top_tokens isa Vector) || isempty(top_tokens)
+                continue
+            end
+
+            top_worm = ("", -1.0)
+            top_tok = ("", -1.0)
+
+            for t in top_tokens
+                if !(t isa Dict)
+                    continue
+                end
+                v = String(get(t, "value", ""))
+                imp = Float64(get(t, "importance", 0.0))
+                if imp > top_tok[2]
+                    top_tok = (v, imp)
+                end
+                whs = get(t, "wormholes", [])
+                if whs !== nothing && whs isa Vector
+                    for w in whs
+                        if w isa Dict
+                            sc = Float64(get(w, "strength", 0.0))
+                            dst = String(get(w, "token", ""))
+                            if sc > top_worm[2]
+                                top_worm = ("$(v)~>$(dst)", sc)
+                            end
+                        end
+                    end
+                end
+            end
+
+            println("[$(String(modname))] top_token=$(top_tok[1]) imp=$(round(top_tok[2], digits=4))  top_wormhole=$(top_worm[1]) sc=$(round(top_worm[2], digits=4))")
+        end
+        println("=== END GUARDRAILS REPORT ===\n")
+    end
+
+    _apply_guardrails!(model)
+    _guardrail_report(model)
 
     function _sanitize_float64(x::Float64)
         max_json_float = 1.0e300

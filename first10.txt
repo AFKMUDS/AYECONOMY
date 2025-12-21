@@ -1,0 +1,10 @@
+{
+  "modules": {
+    "Creativity": {
+      "top_tokens": [
+        {
+          "connections": [
+            {
+              "token": "of",
+              "strength": 0.19090909090909092
+            }
