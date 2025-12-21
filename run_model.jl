@@ -10,7 +10,13 @@ function main()
     end
     
     model_path = "trained_model.json"
-    query = join(ARGS, " ")
+    conversational = false
+    args = copy(ARGS)
+    if !isempty(args) && (args[end] == "--conversational" || args[end] == "-conversational")
+        conversational = true
+        pop!(args)
+    end
+    query = join(args, " ")
     
     println("Loading model from $model_path...")
     
@@ -28,7 +34,11 @@ function main()
         TokenSystem.initialize_modules()
         
         # Run inference with the JSON model
-        run_inference(model_json, query)
+        if conversational
+            run_inference_conversational(model_json, query)
+        else
+            run_inference(model_json, query)
+        end
     catch e
         println("Error: $e")
         return

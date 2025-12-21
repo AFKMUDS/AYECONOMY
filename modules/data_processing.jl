@@ -4,12 +4,13 @@ using JSON3
 using Random
 using StatsBase
 
-# Try to load CUDA if available
-try
-    using CUDA
-    println("CUDA is available for GPU acceleration in data processing")
-catch e
-    println("CUDA not available in data processing, using CPU only: $e")
+if get(ENV, "AYE_USE_CUDA", "0") == "1"
+    try
+        using CUDA
+        println("CUDA is available for GPU acceleration in data processing")
+    catch e
+        println("CUDA not available in data processing, using CPU only: $e")
+    end
 end
 
 # Knowledge Queue structure for the delivery driver system
@@ -21,6 +22,15 @@ end
 
 # Global queues for each module
 global knowledge_queues = Dict{String, KnowledgeQueue}()
+
+function _tokenize_text_for_processing(text::String)
+    if isdefined(Main, :TokenSystem)
+        return Main.TokenSystem.tokenize_text(text)
+    end
+
+    tokens = split(lowercase(text))
+    return [String(w) for w in tokens]
+end
 
 """
     initialize_knowledge_queues()
@@ -250,15 +260,28 @@ function process_entry_with_delivery_driver(entry)
     if haskey(entry, "context")
         text *= entry["context"] * " "
     end
+
+    if isempty(text) && haskey(entry, "text")
+        t = entry["text"]
+        if t isa AbstractString && !isempty(t)
+            text *= String(t) * " "
+        end
+    end
+
+    if isempty(text)
+        for (_, v) in entry
+            if v isa AbstractString && !isempty(v)
+                text *= String(v) * " "
+            end
+        end
+    end
     
     # Skip empty entries
     if isempty(text)
         return "Unknown"
     end
     
-    # Tokenize the text
-    tokens = split(lowercase(text))
-    tokens = [String(w) for w in tokens]
+    tokens = _tokenize_text_for_processing(text)
     
     # Skip empty token lists
     if isempty(tokens)
@@ -403,11 +426,8 @@ function tokenize_entry(entry)
         text *= entry["context"] * " "
     end
     
-    # Simple whitespace tokenization
-    tokens = split(lowercase(text))
-    
-    # Filter out punctuation and short tokens
-    tokens = filter(token -> length(token) > 1 && !all(c -> ispunct(c), token), tokens)
+    tokens = _tokenize_text_for_processing(text)
+    tokens = filter(token -> length(token) > 0, tokens)
     
     return tokens
 end
@@ -877,8 +897,7 @@ function create_filtered_dataset(input_path::String, output_path::String, weak_a
             text *= entry["answer"] * " "
         end
         
-        tokens = split(lowercase(text))
-        tokens = [String(w) for w in tokens]
+        tokens = _tokenize_text_for_processing(text)
         
         # Check if any token is in a weak module
         for token in tokens
@@ -975,9 +994,8 @@ function calculate_entry_similarity(entry1, entry2)
         end
     end
     
-    # Tokenize
-    tokens1 = Set(split(lowercase(text1)))
-    tokens2 = Set(split(lowercase(text2)))
+    tokens1 = Set(_tokenize_text_for_processing(text1))
+    tokens2 = Set(_tokenize_text_for_processing(text2))
     
     # Calculate Jaccard similarity
     intersection = length(intersect(tokens1, tokens2))

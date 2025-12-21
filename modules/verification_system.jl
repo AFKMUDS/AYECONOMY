@@ -4,6 +4,15 @@ using HTTP
 using JSON3
 using Base64
 
+function _tokenize_for_verification(text::String)
+    if isdefined(Main, :TokenSystem)
+        return Main.TokenSystem.tokenize_text(text)
+    end
+
+    tokens = split(lowercase(text))
+    return [String(w) for w in tokens]
+end
+
 # Export functions
 export verify_externally, set_api_key, request_external_verification,
        print_verification_summary, global_verifier, initialize_with_api, initialize_without_api
@@ -219,8 +228,10 @@ function verify_with_wikipedia(concept::String, domain::String)
             
             # Calculate a confidence score based on the search result
             # Higher confidence for exact matches, lower for partial matches
-            title_similarity = length(intersect(split(lowercase(top_result.title)), split(lowercase(concept)))) / 
-                               max(length(split(lowercase(top_result.title))), length(split(lowercase(concept))))
+            title_tokens = _tokenize_for_verification(top_result.title)
+            concept_tokens = _tokenize_for_verification(concept)
+            title_similarity = length(intersect(title_tokens, concept_tokens)) /
+                               max(length(title_tokens), length(concept_tokens))
             
             # Check for contradictory terms that might indicate false information
             contradictory_terms = ["false", "myth", "conspiracy", "debunked", "incorrect", "not true"]

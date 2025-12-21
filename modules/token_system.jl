@@ -8,7 +8,32 @@ using StatsBase
 const CONNECTION_THRESHOLD = 0.5  # Threshold for significant connections between tokens
 const MIN_TOKEN_IMPORTANCE = 0.2  # Minimum importance threshold for tokens to be retained
 
-export Token, KnowledgeModule, process_token, build_connections, initialize_modules, initialize_modules_from_model, process_text, compress_knowledge, prune_low_importance_tokens, CONNECTION_THRESHOLD, MIN_TOKEN_IMPORTANCE, update_reasoning_pathways, initialize_reasoning_pathways
+const IMPORTANCE_COMPRESSION_THRESHOLDS = (
+    1e3, 1e6, 1e9, 1e12, 1e15, 1e18,
+    1e21, 1e24, 1e27, 1e30, 1e33, 1e36,
+    1e39, 1e42
+)
+
+function compress_importance(x::Float64)
+    if !isfinite(x)
+        return prevfloat(Inf)
+    end
+
+    y = x
+    for t in IMPORTANCE_COMPRESSION_THRESHOLDS
+        if y > t
+            y = t + (y - t) / 2
+        end
+    end
+
+    return y
+end
+
+function compress_importance(x::Real)
+    return compress_importance(Float64(x))
+end
+
+export Token, KnowledgeModule, process_token, build_connections, initialize_modules, initialize_modules_from_model, process_text, compress_knowledge, prune_low_importance_tokens, tokenize_text, CONNECTION_THRESHOLD, MIN_TOKEN_IMPORTANCE, update_reasoning_pathways, initialize_reasoning_pathways
 
 # Global timestamp for tracking token access
 if !@isdefined global_timestamp
@@ -28,6 +53,89 @@ end
 mutable struct MicroModel
     tokens::Vector{String}
     importance::Float64
+end
+
+function tokenize_text(text::String)
+    s = lowercase(text)
+    tokens = String[]
+
+    i = firstindex(s)
+    lasti = lastindex(s)
+
+    while i <= lasti
+        c = s[i]
+
+        if isspace(c)
+            i = nextind(s, i)
+            continue
+        end
+
+        if isletter(c) || c == '_'
+            j = i
+            j = nextind(s, j)
+            while j <= lasti
+                cj = s[j]
+                if isletter(cj) || isnumeric(cj) || cj == '_'
+                    j = nextind(s, j)
+                else
+                    break
+                end
+            end
+            push!(tokens, String(SubString(s, i, prevind(s, j))))
+            i = j
+            continue
+        end
+
+        if isnumeric(c) || c == '.'
+            j = i
+            seen_digit = isnumeric(c)
+            seen_dot = c == '.'
+            j = nextind(s, j)
+            while j <= lasti
+                cj = s[j]
+                if isnumeric(cj)
+                    seen_digit = true
+                    j = nextind(s, j)
+                elseif cj == '.' && !seen_dot
+                    seen_dot = true
+                    j = nextind(s, j)
+                else
+                    break
+                end
+            end
+
+            if seen_digit
+                push!(tokens, String(SubString(s, i, prevind(s, j))))
+                i = j
+                continue
+            end
+        end
+
+        if i < lasti
+            c2 = s[nextind(s, i)]
+            op2 = ""
+            if (c == '<' && c2 == '=') || (c == '>' && c2 == '=') || (c == '!' && c2 == '=') ||
+               (c == '=' && c2 == '=') || (c == '-' && c2 == '>') || (c == ':' && c2 == '=')
+                op2 = string(c, c2)
+            end
+            if !isempty(op2)
+                push!(tokens, op2)
+                i = nextind(s, nextind(s, i))
+                continue
+            end
+        end
+
+        if ispunct(c) || c in ['+', '-', '*', '/', '^', '=', '<', '>', '(', ')', '[', ']', '{', '}', ',', ';', ':', '?', '!']
+            push!(tokens, string(c))
+            i = nextind(s, i)
+            continue
+        end
+
+        i = nextind(s, i)
+    end
+
+    filter!(t -> !isempty(t), tokens)
+    return tokens
 end
 
 # Knowledge module structure
@@ -110,18 +218,20 @@ function process_token(token::AbstractString, module_name::String)
         # This implements a supply & demand system where common tokens have diminishing returns
         frequency_factor = 1.0 / (1.0 + 0.01 * module_obj.tokens[token_str].frequency)
         module_obj.tokens[token_str].importance *= 1.01 + (0.005 * frequency_factor)
+        module_obj.tokens[token_str].importance = compress_importance(module_obj.tokens[token_str].importance)
         
         # Apply a small decay chance based on token importance
         # Higher importance tokens have a smaller chance of decay
         # This prevents rigid repetition and allows for more organic learning
         if rand() < 0.05 / (1.0 + module_obj.tokens[token_str].importance)
             module_obj.tokens[token_str].importance *= 0.99
+            module_obj.tokens[token_str].importance = compress_importance(module_obj.tokens[token_str].importance)
         end
         
         module_obj.tokens[token_str].last_accessed = global_timestamp
     else
         # Create new token
-        module_obj.tokens[token_str] = Token(token_str, 1, 1.0, Dict(), global_timestamp)
+        module_obj.tokens[token_str] = Token(token_str, 1, compress_importance(1.0), Dict(), global_timestamp)
     end
 end
 
@@ -264,6 +374,10 @@ end
 Allocate tokens to the most relevant module based on token importance.
 """
 function allocate_compute(tokens::Vector{<:AbstractString})
+    if isempty(modules)
+        initialize_modules()
+    end
+
     allocations = Dict{String, Float64}()
     
     for (name, module_obj) in modules
@@ -281,6 +395,9 @@ function allocate_compute(tokens::Vector{<:AbstractString})
     end
     
     # Select the module with highest bid
+    if isempty(allocations)
+        return "Unknown"
+    end
     return first(sort(collect(allocations), by=x->x[2], rev=true))[1]
 end
 
@@ -392,7 +509,7 @@ function process_messages(module_name::String)
             # Use this information to enhance local knowledge
             if !isempty(token) && !haskey(module_obj.tokens, token)
                 # Create new token with external information
-                module_obj.tokens[token] = Token(token, 1, importance * 0.8, Dict(), global_timestamp)
+                module_obj.tokens[token] = Token(token, 1, compress_importance(importance * 0.8), Dict(), global_timestamp)
                 
                 # Add some connections (with reduced strength)
                 for (connected_token, strength) in connections
@@ -851,7 +968,7 @@ function initialize_modules_from_model(model)
                     token = Token(
                         token_value,
                         get(token_data, "frequency", 1),
-                        get(token_data, "importance", 1.0),
+                        compress_importance(get(token_data, "importance", 1.0)),
                         Dict{String, Float64}(),
                         0  # last_accessed will be updated on first access
                     )
@@ -915,11 +1032,7 @@ function process_text(text::String, metadata::Dict)
         return
     end
     
-    # Tokenize the text (simple whitespace tokenization)
-    words = split(lowercase(text))
-    
-    # Convert SubString to String
-    words = [String(w) for w in words]
+    words = tokenize_text(text)
     
     # Skip empty entries
     if isempty(words)

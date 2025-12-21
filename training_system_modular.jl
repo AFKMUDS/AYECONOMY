@@ -14,12 +14,204 @@ using Dates
 # Global timestamp for model versioning
 global global_timestamp = string(Dates.now())
 
-# Try to load CUDA if available
-try
-    using CUDA
-    println("CUDA is available for GPU acceleration")
-catch e
-    println("CUDA not available, using CPU only: $e")
+if get(ENV, "AYE_USE_CUDA", "0") == "1"
+    try
+        using CUDA
+        println("CUDA is available for GPU acceleration")
+    catch e
+        println("CUDA not available, using CPU only: $e")
+    end
+end
+
+function _get_module_top_tokens_map(model, module_name::String)
+    if !haskey(model, "modules") || !haskey(model["modules"], module_name)
+        return Dict{String, Any}()
+    end
+    module_data = model["modules"][module_name]
+    tokens = get(module_data, "top_tokens", [])
+    m = Dict{String, Any}()
+    for t in tokens
+        v = get(t, "value", nothing)
+        if v !== nothing
+            m[String(v)] = t
+        end
+    end
+    return m
+end
+
+function _is_stop_token(t::AbstractString)
+    return t in ("what", "is", "are", "the", "a", "an", "of", "to", "and", "or", "in", "on", "for", "with", "as", "how", "do", "does", "did", "who", "why", "when", "where", "?", "!", ".", ",")
+end
+
+function _pick_start_token(tokens::Vector{String}, token_map::Dict{String, Any})
+    best = nothing
+    best_score = -Inf
+    for t in tokens
+        if !haskey(token_map, t)
+            continue
+        end
+        imp = Float64(get(token_map[t], "importance", 0.0))
+        score = imp
+        if _is_stop_token(t)
+            score *= 0.05
+        end
+        if score > best_score
+            best_score = score
+            best = t
+        end
+    end
+    if best !== nothing
+        return best
+    end
+
+    best2 = nothing
+    best_imp = -Inf
+    for (v, obj) in token_map
+        imp = get(obj, "importance", 0.0)
+        if imp > best_imp
+            best_imp = imp
+            best2 = v
+        end
+    end
+    return best2
+end
+
+function _choose_next_token(current::String, token_map::Dict{String, Any}, used::Set{String}, query_set::Set{String}, goal_token)
+    if !haskey(token_map, current)
+        return nothing
+    end
+    obj = token_map[current]
+    conns = get(obj, "connections", [])
+    if conns === nothing || isempty(conns)
+        return nothing
+    end
+
+    best = nothing
+    best_score = -Inf
+    for c in conns
+        dst = get(c, "token", nothing)
+        if dst === nothing
+            continue
+        end
+        dsts = String(dst)
+        used_penalty = (dsts in used) ? 0.05 : 1.0
+        strength = Float64(get(c, "strength", 0.0))
+        dst_imp = 0.0
+        if haskey(token_map, dsts)
+            dst_imp = Float64(get(token_map[dsts], "importance", 0.0))
+        end
+        score = strength + 0.05 * log(1.0 + max(dst_imp, 0.0))
+        if dsts in query_set
+            score += 10.0
+        end
+        if goal_token !== nothing && dsts == goal_token
+            score += 20.0
+        end
+        if _is_stop_token(dsts)
+            score *= 0.2
+        end
+        score *= used_penalty
+        if score > best_score
+            best_score = score
+            best = dsts
+        end
+    end
+    return best
+end
+
+function _tokens_to_text(seq::Vector{String})
+    if isempty(seq)
+        return ""
+    end
+    no_space_before = Set([".", ",", ";", ":", "?", "!", ")", "]", "}"])
+    no_space_after = Set(["(", "[", "{"])
+
+    out = IOBuffer()
+    prev = nothing
+    for t in seq
+        if prev === nothing
+            print(out, t)
+        else
+            if t in no_space_before
+                print(out, t)
+            elseif prev in no_space_after
+                print(out, t)
+            else
+                print(out, " ")
+                print(out, t)
+            end
+        end
+        prev = t
+    end
+    return String(take!(out))
+end
+
+function run_inference_conversational(model, query::String; max_tokens::Int=24)
+    tokens = TokenSystem.tokenize_text(query)
+    if isempty(tokens)
+        println("(empty)")
+        return
+    end
+
+    math_run = _extract_math_run(tokens)
+    goal_token = nothing
+    if math_run !== nothing
+        try
+            result = _eval_math_tokens(math_run)
+            result_str = if isfinite(result) && abs(result - round(result)) < 1e-12
+                string(Int(round(result)))
+            else
+                string(result)
+            end
+            push!(tokens, "[calc]")
+            push!(tokens, "=")
+            push!(tokens, result_str)
+            goal_token = result_str
+        catch
+        end
+    end
+
+    query_set = Set(tokens)
+
+    activations = Dict{String, Float64}()
+    for (name, module_data) in model["modules"]
+        activation = 0.0
+        for token_data in get(module_data, "top_tokens", [])
+            token_value = get(token_data, "value", "")
+            if token_value in tokens
+                activation += get(token_data, "importance", 1.0)
+            end
+        end
+        activation *= get(module_data, "importance_score", 1.0)
+        activations[String(name)] = activation
+    end
+    sorted_activations = sort(collect(activations), by=x->x[2], rev=true)
+    top_module = (!isempty(sorted_activations) && sorted_activations[1][2] > 0) ? sorted_activations[1][1] : "Language"
+
+    token_map = _get_module_top_tokens_map(model, top_module)
+    start = _pick_start_token(tokens, token_map)
+    if start === nothing
+        println("(no tokens available)")
+        return
+    end
+
+    seq = String[]
+    used = Set{String}()
+    push!(seq, start)
+    push!(used, start)
+
+    current = start
+    for _ in 1:(max_tokens - 1)
+        nxt = _choose_next_token(current, token_map, used, query_set, goal_token)
+        if nxt === nothing
+            break
+        end
+        push!(seq, nxt)
+        push!(used, nxt)
+        current = nxt
+    end
+
+    println(_tokens_to_text(seq))
 end
 
 # Include all modules
@@ -72,9 +264,7 @@ function process_entry(entry)
         return "Unknown"
     end
     
-    words = split(question)
-    # Convert SubString to String
-    words = [String(w) for w in words]
+    words = TokenSystem.tokenize_text(question)
     
     # Skip empty entries
     if isempty(words)
@@ -327,12 +517,187 @@ end
 
 Run inference on a trained model with a query.
 """
+function _is_number_token(t::AbstractString)
+    s = String(t)
+    return occursin(r"^(?:\d+(?:\.\d+)?|\.\d+)$", s)
+end
+
+function _is_op_token(t::AbstractString)
+    return t in ("+", "-", "*", "/", "^")
+end
+
+function _is_math_token(t::AbstractString)
+    return _is_number_token(t) || _is_op_token(t) || t in ("(", ")")
+end
+
+function _extract_math_run(tokens::Vector{String})
+    best = nothing
+    best_len = 0
+    i = 1
+    while i <= length(tokens)
+        if !_is_math_token(tokens[i])
+            i += 1
+            continue
+        end
+
+        j = i
+        has_op = false
+        while j <= length(tokens) && _is_math_token(tokens[j])
+            if _is_op_token(tokens[j])
+                has_op = true
+            end
+            j += 1
+        end
+
+        len = j - i
+        if has_op && len > best_len
+            best = tokens[i:(j - 1)]
+            best_len = len
+        end
+
+        i = j
+    end
+
+    return best
+end
+
+function _math_token_ratio(tokens::Vector{String})
+    if isempty(tokens)
+        return 0.0
+    end
+    math_count = count(t -> _is_math_token(t), tokens)
+    return math_count / length(tokens)
+end
+
+function _precedence(op::AbstractString)
+    if op == "^"
+        return 4
+    elseif op == "*" || op == "/"
+        return 3
+    elseif op == "+" || op == "-"
+        return 2
+    end
+    return 0
+end
+
+function _right_associative(op::AbstractString)
+    return op == "^"
+end
+
+function _apply_op(op::AbstractString, a::Float64, b::Float64)
+    if op == "+"
+        return a + b
+    elseif op == "-"
+        return a - b
+    elseif op == "*"
+        return a * b
+    elseif op == "/"
+        return a / b
+    elseif op == "^"
+        return a ^ b
+    end
+    error("Unknown operator: $op")
+end
+
+function _eval_math_tokens(expr_tokens::Vector{String})
+    output = Any[]
+    ops = String[]
+
+    function pop_op!()
+        op = pop!(ops)
+        b = pop!(output)
+        a = pop!(output)
+        push!(output, _apply_op(op, Float64(a), Float64(b)))
+    end
+
+    i = 1
+    while i <= length(expr_tokens)
+        t = expr_tokens[i]
+
+        if _is_number_token(t)
+            push!(output, parse(Float64, t))
+        elseif t == "("
+            push!(ops, t)
+        elseif t == ")"
+            while !isempty(ops) && ops[end] != "("
+                pop_op!()
+            end
+            if isempty(ops) || ops[end] != "("
+                error("Mismatched parentheses")
+            end
+            pop!(ops)
+        elseif _is_op_token(t)
+            if t == "-" && (i == 1 || (expr_tokens[i-1] in ("(", "+", "-", "*", "/", "^")))
+                push!(output, 0.0)
+            end
+
+            while !isempty(ops)
+                top = ops[end]
+                if top == "("
+                    break
+                end
+                ptop = _precedence(top)
+                pt = _precedence(t)
+                if ptop > pt || (ptop == pt && !_right_associative(t))
+                    pop_op!()
+                else
+                    break
+                end
+            end
+            push!(ops, t)
+        else
+            error("Invalid token in expression: $t")
+        end
+
+        i += 1
+    end
+
+    while !isempty(ops)
+        if ops[end] == "("
+            error("Mismatched parentheses")
+        end
+        pop_op!()
+    end
+
+    if length(output) != 1
+        error("Invalid expression")
+    end
+
+    return Float64(output[1])
+end
+
 function run_inference(model, query::String)
     println("\n=== RUNNING INFERENCE ===")
     println("Query: $query")
     
     # Tokenize query
-    tokens = split(lowercase(query))
+    tokens = TokenSystem.tokenize_text(query)
+
+    math_run = _extract_math_run(tokens)
+    if math_run !== nothing
+        try
+            result = _eval_math_tokens(math_run)
+            is_math_only = _math_token_ratio(tokens) >= 0.80
+
+            result_str = if isfinite(result) && abs(result - round(result)) < 1e-12
+                string(Int(round(result)))
+            else
+                string(result)
+            end
+
+            if is_math_only
+                println("\nCalculator:")
+                println("  Expression: $(join(math_run, " "))")
+                println("  Result: $(result_str)")
+                return
+            else
+                push!(tokens, "=")
+                push!(tokens, result_str)
+            end
+        catch e
+            println("\nCalculator error (falling back to graph inference): $e")
+        end
+    end
     
     # Skip if no tokens
     if isempty(tokens)
@@ -386,7 +751,7 @@ function run_inference(model, query::String)
             relevant_knowledge = []
             for concept in verified_knowledge
                 # Simple relevance check: any token overlap
-                concept_tokens = split(lowercase(concept))
+                concept_tokens = TokenSystem.tokenize_text(concept)
                 if any(token in tokens for token in concept_tokens)
                     push!(relevant_knowledge, concept)
                 end
@@ -791,11 +1156,48 @@ function save_model_to_file(file_path::String; progress::Float64=0.0, last_proce
         "total_entries" => total_entries,
         "global_timestamp" => global_timestamp
     )
-    
-    # Save to file
-    open(file_path, "w") do io
+
+    function _sanitize_float64(x::Float64)
+        max_json_float = 1.0e300
+        if isnan(x)
+            return 0.0
+        end
+        if !isfinite(x)
+            return signbit(x) ? -max_json_float : max_json_float
+        end
+        if abs(x) > max_json_float
+            return x < 0 ? -max_json_float : max_json_float
+        end
+        return x
+    end
+
+    function _sanitize_json!(obj)
+        if obj isa Dict
+            for (k, v) in obj
+                obj[k] = _sanitize_json!(v)
+            end
+            return obj
+        elseif obj isa Vector
+            for i in eachindex(obj)
+                obj[i] = _sanitize_json!(obj[i])
+            end
+            return obj
+        elseif obj isa Float64
+            return _sanitize_float64(obj)
+        elseif obj isa Real
+            return obj
+        else
+            return obj
+        end
+    end
+
+    _sanitize_json!(model)
+
+    tmp_path = file_path * ".tmp"
+    open(tmp_path, "w") do io
         JSON3.write(io, model)
     end
+    mv(tmp_path, file_path; force=true)
     
     println("Model saved to $file_path")
     return model
